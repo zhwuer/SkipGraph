@@ -3,7 +3,8 @@
 #include <utility>
 #include <vector>
 #include <sstream>
-
+#include <chrono>
+#include <random>
 #include "caf/all.hpp"
 #include "caf/io/all.hpp"
 
@@ -46,15 +47,12 @@ optional<int> toint(const string& str) {
     return none;
 }
 
-string generate_ms_vector(int length) {
-    char arr[length];
-    srand((unsigned)time(0));
-    int tmp = rand();
-    while (length--) {
-        arr[length] = tmp % 2 + '0';
-        tmp /= 2;
-    }
-    return string(arr);
+string get_ms_vector(int length) {
+    string res;
+    auto seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::default_random_engine e(seed);
+    while (length--) res += (e() % 2) ? "1" : "0";
+    return res;
 }
 
 namespace Node {
@@ -137,7 +135,9 @@ namespace Node {
                     // insert new node after target node
                     new_node->state.left_neighbor[l] = target_node;
                     new_node->state.right_neighbor[l] = target_node->state.right_neighbor[l];
-                    target_node->state.right_neighbor[l]->state.left_neighbor[l] = new_node;
+                    if (target_node->state.right_neighbor[l]) {
+                        target_node->state.right_neighbor[l]->state.left_neighbor[l] = new_node;
+                    }
                     target_node->state.right_neighbor[l] = new_node;
 
                     string t_ms_vector = new_node->state.ms_vector.substr(0, l+1); // target membership vector
@@ -166,6 +166,163 @@ namespace Node {
             }
         };
     }
+}
+
+
+using node = typed_actor<
+        result<void>(ok_atom),
+        result<void>(timeout_atom),
+        result<void>(get_atom, strong_actor_ptr, int, int),
+        result<void>(join_atom),
+        result<void>(put_atom, int, int, uint16_t, string, bool, string)
+>;
+
+struct state {
+    int key{};
+    int max_level{};
+    uint16_t server_port{};
+    string server_addr;
+    bool delete_flag{};
+    string ms_vector;
+    vector<node::stateful_pointer<state>> left_neighbor;
+    vector<node::stateful_pointer<state>> right_neighbor;
+};
+
+node::behavior_type node_impl(node::stateful_pointer<state> self) {
+    return {
+        [=](ok_atom) {
+            cout << "The key is stored in "
+                 << self->state.server_addr + ":"
+                 << std::to_string(self->state.server_port) << endl;
+        },
+        [=](timeout_atom) {
+            cout << "Could not find the key!\n";
+       },
+        [=](get_atom, const strong_actor_ptr& start_actor, int search_key, int level) {
+            string ss;
+            scoped_actor tmp{self->system()};
+            // auto start_node = actor_cast<node::stateful_pointer<state>>(start_actor);
+            if (self->state.key == search_key) {
+                auto hdl = actor_cast<actor>(start_actor);
+                self->request(hdl, task_timeout, ok_atom_v);
+            } else if (self->state.key < search_key) {
+                while (level >= 0) {
+                    if (self->state.right_neighbor[level] && self->state.right_neighbor[level]->state.key <= search_key) {
+                        auto hdl = actor_cast<actor>(self->state.right_neighbor[level]);
+                        self->request(hdl, task_timeout, get_atom_v, start_actor, search_key, level);
+                        break;
+                    } else level = level - 1;
+                }
+            } else {
+                while (level >= 0) {
+                    if (self->state.left_neighbor[level] && self->state.left_neighbor[level]->state.key >= search_key) {
+                        auto hdl = actor_cast<actor>(self->state.left_neighbor[level]);
+                        self->request(hdl, task_timeout, get_atom_v, start_actor, search_key, level);
+                        break;
+                    } else level = level - 1;
+                }
+            }
+            if (level < 0) {
+                auto hdl = actor_cast<actor>(start_actor);
+                self->request(hdl, task_timeout, timeout_atom_v);
+            }
+
+        },
+        [=](join_atom) {
+            auto new_node = actor_cast<node::stateful_pointer<state>>(self->current_sender());
+            cout << "New_node: " << new_node->address().get() << " Key: " << new_node->state.key << endl;
+            // itself is the introduce node
+            node::stateful_pointer<state> target_node;
+//            scoped_actor tmp{self->system()};
+//            tmp->request(actor_cast<actor>(self), task_timeout, get_atom_v,
+//                    actor_cast<strong_actor_ptr>(self), new_node->state.key, new_node->state.max_level);
+            target_node = self;
+            int l = 0;
+            while (true) {
+                // insert new node after target node
+                new_node->state.left_neighbor[l] = target_node;
+                new_node->state.right_neighbor[l] = target_node->state.right_neighbor[l];
+                if (target_node->state.right_neighbor[l]) {
+                    target_node->state.right_neighbor[l]->state.left_neighbor[l] = new_node;
+                }
+                target_node->state.right_neighbor[l] = new_node;
+
+                string t_ms_vector = new_node->state.ms_vector.substr(0, l+1); // target membership vector
+                while (target_node != nullptr && target_node->state.ms_vector.substr(0, l+1) != t_ms_vector) {
+                    target_node = target_node->state.left_neighbor[l];
+                }
+                if (target_node) {
+                    l = l + 1;
+                } else break;
+            }
+        },
+        [=](put_atom, int k, int m, uint16_t p, string s, bool d, string ms) {
+            self->state.key = k;
+            self->state.max_level = m;
+            self->state.server_port = p;
+            self->state.server_addr = std::move(s);
+            self->state.delete_flag = d;
+            self->state.ms_vector = std::move(ms);
+            self->state.left_neighbor.resize(m);
+            self->state.right_neighbor.resize(m);
+        }
+    };
+}
+
+struct serv_state {
+    uint16_t port{};
+    string addr;
+    vector<node> nodes;
+};
+
+behavior server_handler(stateful_actor<serv_state>* self) {
+    return {
+        [=](get_atom, int key) {
+            // Find the start node
+            int i = 0;
+            while (i < self->state.nodes.size() && actor_cast<node::stateful_pointer<state>>(self->state.nodes[i])->state.key < key) i++;
+            auto start_node = self->state.nodes[i-1];
+            int level = actor_cast<node::stateful_pointer<state>>(start_node)->state.max_level;
+            // Send request to start node to search
+            self->request(actor_cast<actor>(start_node), task_timeout, get_atom_v, actor_cast<strong_actor_ptr>(start_node), key, level);
+       },
+        [=](join_atom, int key) {
+            int i = 0;
+            while (i < self->state.nodes.size() && actor_cast<node::stateful_pointer<state>>(self->state.nodes[i])->state.key < key) i++;
+            // Find the introduce node
+            auto intro_actor = self->state.nodes[i-1];
+            auto intro_node = actor_cast<node::stateful_pointer<state>>(intro_actor);
+            // Create new node && add the new node to the server node list
+            auto new_actor = self->spawn(node_impl);
+            auto new_node = actor_cast<node::stateful_pointer<state>>(new_actor);
+            scoped_actor tmp{self->system()};
+            // Initializing new actor
+            tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.port,
+                         self->state.addr, false, get_ms_vector(intro_node->state.max_level - 1)).receive(
+                            [&](){cout << "New node initialized!!!" << endl;}, [&](error& err) {});
+            self->state.nodes.insert(self->state.nodes.begin()+i, new_actor);
+            // Send request to introduce node to add the new node
+            // self->request(intro_actor, task_timeout, join_atom_v, actor_cast<strong_actor_ptr>(self->state.nodes.back()));
+            new_node->request(intro_actor, task_timeout, join_atom_v);
+            return "hello";
+        },
+        [=](put_atom, const string& host, uint16_t port) {
+            // called in the run_server function
+            self->state.addr = host;
+            self->state.port = port;
+            int max_level = 4;
+            auto tmp = self->spawn(node_impl);
+            anon_send(tmp, put_atom_v, INT32_MIN, max_level, port, host, false, get_ms_vector(max_level - 1));
+            self->state.nodes.emplace_back(tmp);
+            cout << "Successfully add two new nodes into server!" << endl;
+        },
+        [=](get_atom) {
+            cout << "Show all nodes in server " << self->state.addr << ":" << self->state.port << endl;
+            for (auto i : self->state.nodes) {
+                cout << "Key = " << actor_cast<node::stateful_pointer<state>>(i)->state.key << endl;
+            }
+        }
+    };
 }
 
 namespace Server {
@@ -205,8 +362,11 @@ namespace Server {
                 auto new_node = actor_cast<stateful_actor<Node::state>*>(new_actor);
                 self->state.node_list.emplace_back(new_node);
                 // Initialize new node
-                self->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.port,
-                    self->state.addr, false, generate_ms_vector(intro_node->state.max_level-1));
+                scoped_actor tmp{self->system()};
+                tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.port,
+                             self->state.addr, false, get_ms_vector(intro_node->state.max_level - 1)).receive(
+                            [](string& str){cout << str << endl;},
+                            [&](error& err) {});
                 // send request to introduce node to add the new node
                 new_node->request(actor_cast<actor>(intro_node), task_timeout, join_atom_v);
                 // new_node->request(actor_cast<actor>(intro_node), task_timeout, ok_atom_v);
@@ -231,7 +391,7 @@ namespace Server {
                 auto tmp = self->spawn(Node::operation_handler);
                 int max_level = 4;
                 // Initializing the first node
-                anon_send(tmp, put_atom_v, INT32_MIN, max_level, port, host, false, generate_ms_vector(max_level-1));
+                anon_send(tmp, put_atom_v, INT32_MIN, max_level, port, host, false, get_ms_vector(max_level - 1));
                 self->state.node_list.emplace_back(actor_cast<stateful_actor<Node::state>*>(tmp));
             },
             [=](get_atom) {
@@ -324,20 +484,19 @@ namespace Client {
     }
 
     behavior running(client_node self, const actor& op_hdl) {
-        aout(self) << "test start" << endl;
-        anon_send(op_hdl, get_atom_v, 5);
-        aout(self) << "test end" << endl;
         auto send_task = [=](auto op, int key) {
             if (key == INT32_MIN) {
-                self->request(op_hdl, task_timeout, get_atom_v).then(
-                    [=](const string& str) { cout << str << endl; },
-                    [=](const error&) { self->send(self, op, key); }
-                );
+                self->request(op_hdl, task_timeout, get_atom_v);
+//                .then(
+//                    [=](const string& str) { cout << str << endl; },
+//                    [=](const error&) { self->send(self, op, key); }
+//                );
             } else {
-                self->request(op_hdl, task_timeout, op, key).then(
-                    [=](const string& str) { cout << str << endl; },
-                    [=](const error&) { self->send(self, op, key); }
-                );
+                self->request(op_hdl, task_timeout, op, key);
+//                .then(
+//                    [=](const string& str) { cout << str << endl; },
+//                    [=](const error&) { self->send(self, op, key); }
+//                );
             }
         };
         for (auto& x : self->state.tasks) {
@@ -402,6 +561,7 @@ void client_window(actor_system& system, const config& cfg) {
                               static_cast<uint16_t>(local_port));
             } else {
                 cout << "error command!!!" << endl;
+                usage();
             }
         },
         [&](const string& arg0, const string& arg1) {
@@ -427,7 +587,7 @@ void client_window(actor_system& system, const config& cfg) {
 }
 
 void run_server(actor_system& system, const config& cfg) {
-    auto op_hdl = system.spawn(Server::server_handler);
+    auto op_hdl = system.spawn(server_handler);
     cout << "*** try publish at port " << cfg.port << endl;
     auto expected_port = io::publish(op_hdl, cfg.port, nullptr, true);
     if (!expected_port) {
