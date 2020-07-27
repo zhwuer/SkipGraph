@@ -54,6 +54,11 @@ string get_ms_vector(int length) {
     return res;
 }
 
+struct address {
+    string ip;
+    uint16_t port{};
+};
+
 using node = typed_actor<
         result<void>(ok_atom),
         result<void>(timeout_atom),
@@ -67,8 +72,7 @@ using node = typed_actor<
 struct state {
     int key{};
     int max_level{};
-    uint16_t server_port{};
-    string server_addr;
+    address server;
     bool delete_flag{};
     string ms_vector;
     vector<node::stateful_pointer<state>> left_neighbor;
@@ -79,8 +83,8 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
     return {
         [=](ok_atom) {
             cout << "The key is stored in "
-                 << self->state.server_addr + ":"
-                 << std::to_string(self->state.server_port) << endl;
+                 << self->state.server.ip + ":"
+                 << std::to_string(self->state.server.port) << endl;
         },
         [=](timeout_atom) {
             cout << "Could not find the key!\n";
@@ -160,8 +164,8 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
         [=](put_atom, int k, int m, uint16_t p, string s, bool d, string ms) {
             self->state.key = k;
             self->state.max_level = m;
-            self->state.server_port = p;
-            self->state.server_addr = std::move(s);
+            self->state.server.port = p;
+            self->state.server.ip = std::move(s);
             self->state.delete_flag = d;
             self->state.ms_vector = std::move(ms);
             self->state.left_neighbor.resize(m);
@@ -189,9 +193,9 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
 }
 
 struct server_state {
-    uint16_t port{};
-    string addr;
+    address myaddr;
     vector<node> nodes;
+    vector<address> servers;
 };
 
 behavior server_handler(stateful_actor<server_state>* self) {
@@ -211,13 +215,16 @@ behavior server_handler(stateful_actor<server_state>* self) {
             // Find the introduce node
             auto intro_actor = self->state.nodes[i-1];
             auto intro_node = actor_cast<node::stateful_pointer<state>>(intro_actor);
+
+            // auto other_server = self->system().middleman().connect();
+
             // Create new node && add the new node to the server node list
             auto new_actor = self->spawn(node_impl);
             auto new_node = actor_cast<node::stateful_pointer<state>>(new_actor);
             scoped_actor tmp{self->system()};
             // Initializing new actor
-            tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.port,
-                         self->state.addr, false, get_ms_vector(intro_node->state.max_level - 1)).receive(
+            tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.myaddr.port,
+                         self->state.myaddr.ip, false, get_ms_vector(intro_node->state.max_level - 1)).receive(
                          [](){}, [&](error& err) {});
             self->state.nodes.insert(self->state.nodes.begin()+i, new_actor);
             // Send request to introduce node to add the new node
@@ -234,8 +241,8 @@ behavior server_handler(stateful_actor<server_state>* self) {
         },
         [=](put_atom, const string& host, uint16_t port) {
             // called in the run_server function
-            self->state.addr = host;
-            self->state.port = port;
+            self->state.myaddr.ip = host;
+            self->state.myaddr.port = port;
             int max_level = 4;
             auto tmp = self->spawn(node_impl);
             anon_send(tmp, put_atom_v, INT32_MIN, max_level, port, host, false, get_ms_vector(max_level - 1));
@@ -243,14 +250,16 @@ behavior server_handler(stateful_actor<server_state>* self) {
         },
         [=](get_atom, const string& str) {
             if (str == "server") {
-                cout << "Show nodes in server " << self->state.addr << ":" << self->state.port << endl;
+                cout << "Show nodes in server " << self->state.myaddr.ip << ":" << self->state.myaddr.port << endl;
                 for (auto i : self->state.nodes) {
                     cout << "Key = " << actor_cast<node::stateful_pointer<state>>(i)->state.key << endl;
                 }
             } else {
                 self->request(actor_cast<actor>(self->state.nodes[0]), task_timeout, get_atom_v);
             }
-
+        },
+        [=](add_atom, const string& host, uint16_t port){
+            if (host != self->state.myaddr.ip) self->state.servers.push_back({host, port});
         }
     };
 }
@@ -297,6 +306,9 @@ namespace Client {
             [=](get_atom op, const string& str) {
                 if (str == "server") self->state.tasks.emplace_back(task{op, INT32_MIN});
                 else self->state.tasks.emplace_back(task{op, INT32_MAX});
+            },
+            [=](add_atom, const string& host, uint16_t port) {
+                cout << "Please connect to a server first" << endl;
             },
             [=](connect_atom, const string& host, uint16_t port) {
                 connecting(self, host, port);
@@ -357,6 +369,9 @@ namespace Client {
             [=](join_atom op, int key) { send_task(op, key); },
             [=](delete_atom op, int key) { send_task(op, key); },
             [=](get_atom op, const string& str) { show_task(op, str); },
+            [=](add_atom, const string& host, uint16_t port) {
+                self->request(op_hdl, task_timeout, add_atom_v, host, port);
+            },
             [=](connect_atom, const string& host, uint16_t port) {
                 connecting(self, host, port);
             },
@@ -368,7 +383,8 @@ void client_window(actor_system& system, const config& cfg) {
     auto usage = [] {
         cout << "Usage:" << endl
              << "  quit                  : terminates the program" << endl
-             << "  connect <host> <port> : connects to a remote actor" << endl
+             << "  connect <host> <port> : connects to a remote server" << endl
+             << "  add <host> <port>     : add a remote server" << endl
              << "  search <key>          : search a node in Skip Graph" << endl
              << "  add <key>             : add a new node in Skip Graph" << endl
              << "  delete <key>          : delete a exist node in Skip Graph" << endl
@@ -395,7 +411,7 @@ void client_window(actor_system& system, const config& cfg) {
             done = true;
         },
         [&](string& arg0, string& arg1, string& arg2) {
-            if (arg0 == "connect") {
+            if (arg0 == "connect" || arg0 == "add") {
                 char* end = nullptr;
                 auto local_port = strtoul(arg2.c_str(), &end, 10);
                 if (end != arg2.c_str() + arg2.size())
@@ -403,9 +419,12 @@ void client_window(actor_system& system, const config& cfg) {
                 else if (local_port > std::numeric_limits<uint16_t>::max())
                     cout << R"(")" << arg2 << R"(" > )"
                          << std::numeric_limits<uint16_t>::max() << endl;
-                else
-                    anon_send(client, connect_atom_v, move(arg1),
-                              static_cast<uint16_t>(local_port));
+                else {
+                    if (arg0 == "connect")
+                        anon_send(client, connect_atom_v, move(arg1), static_cast<uint16_t>(local_port));
+                    else
+                        anon_send(client, add_atom_v, move(arg1), static_cast<uint16_t>(local_port));
+                }
             } else {
                 cout << "error command!!!" << endl;
                 usage();
