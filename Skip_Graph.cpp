@@ -13,7 +13,6 @@ using std::endl;
 using std::string;
 using std::vector;
 using std::stringstream;
-
 using namespace caf;
 
 constexpr auto task_timeout = std::chrono::seconds(10);
@@ -169,25 +168,33 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
             self->state.right_neighbor.resize(m);
         },
         [=](get_atom){
-            cout << "Show all nodes..." << endl;
+            cout << "Show all nodes:" << endl;
             node::stateful_pointer<state> begin_node = self;
             while (begin_node->state.left_neighbor[0])
                 begin_node = begin_node->state.right_neighbor[0];
-            while (begin_node) {
-                cout << "Key = " << begin_node->state.key << endl;
-                begin_node = begin_node->state.right_neighbor[0];
+            int max_level = begin_node->state.max_level;
+            for (int i = max_level-1; i >= 0; i--) {
+                auto iter = begin_node;
+                cout << "HEAD" << " (" << iter->state.ms_vector << ") ----- ";
+                while (iter->state.right_neighbor[i]) {
+                    cout << iter->state.right_neighbor[i]->state.key
+                         << " (" << iter->state.right_neighbor[i]->state.ms_vector << ") ----- ";
+                    iter = iter->state.right_neighbor[i];
+                }
+                cout << "TAIL" << endl;
             }
+
         }
     };
 }
 
-struct serv_state {
+struct server_state {
     uint16_t port{};
     string addr;
     vector<node> nodes;
 };
 
-behavior server_handler(stateful_actor<serv_state>* self) {
+behavior server_handler(stateful_actor<server_state>* self) {
     return {
         [=](get_atom, int key) {
             // Find the start node
@@ -448,7 +455,7 @@ void run_server(actor_system& system, const config& cfg) {
     anon_send_exit(op_hdl, exit_reason::user_shutdown);
 }
 
-void caf_main(actor_system& system, const config& cfg) {
+[[maybe_unused]] void caf_main(actor_system& system, const config& cfg) {
     auto f = cfg.server_mode ? run_server : client_window;
     f(system, cfg);
 }
