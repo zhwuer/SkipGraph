@@ -2,7 +2,6 @@
 #include <iostream>
 #include <utility>
 #include <vector>
-#include <sstream>
 #include <chrono>
 #include <random>
 #include "caf/all.hpp"
@@ -15,21 +14,21 @@ using std::vector;
 using std::stringstream;
 using namespace caf;
 
+using node = typed_actor<
+        result<void>(ok_atom),
+        result<void>(timeout_atom),
+        result<void>(get_atom, strong_actor_ptr, int, int),
+        result<void>(join_atom),
+        result<void>(delete_atom, int),
+        result<void>(put_atom, int, int, uint16_t, string, bool, string),
+        result<void>(get_atom)
+>;
+
+CAF_BEGIN_TYPE_ID_BLOCK(skip_graph, first_custom_type_id)
+    CAF_ADD_TYPE_ID(skip_graph, (node))
+CAF_END_TYPE_ID_BLOCK(skip_graph)
+
 constexpr auto task_timeout = std::chrono::seconds(10);
-
-class config : public actor_system_config {
-public:
-    uint16_t port = 0;
-    string host = "localhost";
-    bool server_mode = false;
-
-    config() {
-        opt_group{custom_options_, "global"}
-                .add(port, "port,p", "set port")
-                .add(host, "host,H", "set host (ignored in server mode)")
-                .add(server_mode, "server-mode,s", "enable server mode");
-    }
-};
 
 string trim(string s) {
     auto not_space = [](char c) { return isspace(c) == 0; };
@@ -58,16 +57,6 @@ struct address {
     string ip;
     uint16_t port{};
 };
-
-using node = typed_actor<
-        result<void>(ok_atom),
-        result<void>(timeout_atom),
-        result<void>(get_atom, strong_actor_ptr, int, int),
-        result<void>(join_atom),
-        result<void>(delete_atom, int),
-        result<void>(put_atom, int, int, uint16_t, string, bool, string),
-        result<void>(get_atom)
->;
 
 struct state {
     int key{};
@@ -215,21 +204,48 @@ behavior server_handler(stateful_actor<server_state>* self) {
             // Find the introduce node
             auto intro_actor = self->state.nodes[i-1];
             auto intro_node = actor_cast<node::stateful_pointer<state>>(intro_actor);
-
-            // auto other_server = self->system().middleman().connect();
-
-            // Create new node && add the new node to the server node list
-            auto new_actor = self->spawn(node_impl);
-            auto new_node = actor_cast<node::stateful_pointer<state>>(new_actor);
             scoped_actor tmp{self->system()};
-            // Initializing new actor
-            tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level, self->state.myaddr.port,
-                         self->state.myaddr.ip, false, get_ms_vector(intro_node->state.max_level - 1)).receive(
-                         [](){}, [&](error& err) {});
-            self->state.nodes.insert(self->state.nodes.begin()+i, new_actor);
-            // Send request to introduce node to add the new node
-            // self->request(intro_actor, task_timeout, join_atom_v, actor_cast<strong_actor_ptr>(self->state.nodes.back()));
-            new_node->request(intro_actor, task_timeout, join_atom_v);
+
+            // Find the target server TODO: Load balance optimization
+            address another_server{string(""), 0};
+            if (!self->state.servers.empty()) another_server = self->state.servers.back();
+            auto conn = self->system().middleman().connect(another_server.ip, another_server.port);
+
+            if (!conn) {  // if there are no other server nodes
+                // Create new node && add the new node to the server node list
+                auto new_actor = self->spawn(node_impl);
+                auto new_node = actor_cast<node::stateful_pointer<state>>(new_actor);
+                // Initializing new actor
+                tmp->request(new_actor, task_timeout, put_atom_v, key, intro_node->state.max_level,
+                             self->state.myaddr.port, self->state.myaddr.ip, false,
+                             get_ms_vector(intro_node->state.max_level - 1)).receive([](){}, [&](error& err) {});
+                self->state.nodes.insert(self->state.nodes.begin()+i, new_actor);
+                // Send request to introduce node to add the new node
+                new_node->request(intro_actor, task_timeout, join_atom_v);
+            } else {    // find another server to store the data node --- load balance
+                auto mm = self->system().middleman().actor_handle();
+                self->request(mm, infinite, connect_atom_v, another_server.ip, another_server.port).await(
+                    [=](const node_id&, strong_actor_ptr serv, const std::set<string>& ifs) {
+                        if (!serv) {
+                            aout(self) << R"(*** no server found at ")" << another_server.ip << R"(":)"
+                                       << another_server.port << endl;
+                            return;
+                        }
+                        if (!ifs.empty()) {
+                            aout(self) << R"(*** typed actor found at ")" << another_server.ip << R"(":)"
+                                       << another_server.port << ", but expected an untyped actor " << endl;
+                            return;
+                        }
+                        auto remote_server = actor_cast<actor>(serv);
+                        self->request(remote_server, task_timeout, join_atom_v, key);
+                    },
+                    [=](const error& err) {
+                        aout(self) << R"(*** cannot connect to ")" << another_server.ip << R"(":)" << another_server.port
+                                   << " => " << to_string(err) << endl;
+                    }
+                );
+            }
+
         },
         [=](delete_atom, int key) {
             int i = 0;
@@ -259,7 +275,10 @@ behavior server_handler(stateful_actor<server_state>* self) {
             }
         },
         [=](add_atom, const string& host, uint16_t port){
-            if (host != self->state.myaddr.ip) self->state.servers.push_back({host, port});
+            if (host != self->state.myaddr.ip) {
+                self->state.servers.push_back({host, port});
+                cout << "Successfully added a remote server: " << host << ":" << std::to_string(port) << endl;
+            }
         }
     };
 }
@@ -322,15 +341,15 @@ namespace Client {
         self->request(mm, infinite, connect_atom_v, host, port).await(
             [=](const node_id&, strong_actor_ptr serv, const std::set<string>& ifs) {
                 if (!serv) {
-                    aout(self) << R"(*** no server found at ")" << host << R"(":)" << port << endl;
+                    cout << R"(*** no server found at ")" << host << R"(":)" << port << endl;
                     return;
                 }
                 if (!ifs.empty()) {
-                    aout(self) << R"(*** typed actor found at ")" << host << R"(":)"
+                    cout << R"(*** typed actor found at ")" << host << R"(":)"
                                << port << ", but expected an untyped actor " << endl;
                     return;
                 }
-                aout(self) << "*** successfully connected to server" << endl;
+                cout << "*** successfully connected to server" << endl;
                 self->state.cur_server = serv;
                 auto hdl = actor_cast<actor>(serv);
                 self->monitor(hdl);
@@ -378,6 +397,21 @@ namespace Client {
         };
     }
 }
+
+class config : public actor_system_config {
+public:
+    uint16_t port = 0;
+    string host = "localhost";
+    bool server_mode = false;
+
+    config() {
+        add_actor_type("node_implementation", node_impl);
+        opt_group{custom_options_, "global"}
+                .add(port, "port,p", "set port")
+                .add(host, "host,H", "set host (ignored in server mode)")
+                .add(server_mode, "server-mode,s", "enable server mode");
+    }
+};
 
 void client_window(actor_system& system, const config& cfg) {
     auto usage = [] {
@@ -454,6 +488,7 @@ void client_window(actor_system& system, const config& cfg) {
         auto msg = message_builder(words.begin(), words.end()).move_to_message();
         if (!eval(msg))
             usage();
+        cout << ">>> ";
     }
 }
 
@@ -480,4 +515,4 @@ void run_server(actor_system& system, const config& cfg) {
 }
 
 // creates a main function for us that calls our caf_main
-CAF_MAIN(io::middleman)
+CAF_MAIN(id_block::skip_graph, io::middleman)
