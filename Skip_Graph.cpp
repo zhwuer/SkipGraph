@@ -24,10 +24,6 @@ using node = typed_actor<
         result<void>(get_atom)
 >;
 
-CAF_BEGIN_TYPE_ID_BLOCK(skip_graph, first_custom_type_id)
-    CAF_ADD_TYPE_ID(skip_graph, (node))
-CAF_END_TYPE_ID_BLOCK(skip_graph)
-
 constexpr auto task_timeout = std::chrono::seconds(10);
 
 string trim(string s) {
@@ -127,7 +123,7 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 while (target_node != nullptr && target_node->state.ms_vector.substr(0, l+1) != t_ms_vector) {
                     target_node = target_node->state.left_neighbor[l];
                 }
-                if (target_node && l < new_node->state.max_level) {
+                if (target_node && l + 1 < new_node->state.max_level) {
                     l = l + 1;
                 } else break;
             }
@@ -140,7 +136,7 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 cout << "The element does not exist!" << endl;
                 return;
             } else {
-                for (int i = 0; i <= target_node->state.max_level; i++) {
+                for (int i = 0; i < target_node->state.max_level; i++) {
                     if (target_node->state.left_neighbor[i])
                         target_node->state.left_neighbor[i]->state.right_neighbor[i] = target_node->state.right_neighbor[i];
                     if (target_node->state.right_neighbor[i])
@@ -161,20 +157,20 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
             self->state.right_neighbor.resize(m);
         },
         [=](get_atom){
-            cout << "Show all nodes:" << endl;
+            cout << "Skip Graph:" << endl;
             node::stateful_pointer<state> begin_node = self;
             while (begin_node->state.left_neighbor[0])
                 begin_node = begin_node->state.right_neighbor[0];
             int max_level = begin_node->state.max_level;
             for (int i = max_level-1; i >= 0; i--) {
                 auto iter = begin_node;
-                cout << "HEAD" << " (" << iter->state.ms_vector << ") ----- ";
+                cout << "Level " << std::to_string(i) << ": head" << " (" << iter->state.ms_vector << ") ----- ";
                 while (iter->state.right_neighbor[i]) {
                     cout << iter->state.right_neighbor[i]->state.key
                          << " (" << iter->state.right_neighbor[i]->state.ms_vector << ") ----- ";
                     iter = iter->state.right_neighbor[i];
                 }
-                cout << "TAIL" << endl;
+                cout << "tail" << endl;
             }
 
         }
@@ -194,7 +190,7 @@ behavior server_handler(stateful_actor<server_state>* self) {
             int i = 0;
             while (i < self->state.nodes.size() && actor_cast<node::stateful_pointer<state>>(self->state.nodes[i])->state.key < key) i++;
             auto start_node = self->state.nodes[i-1];
-            int level = actor_cast<node::stateful_pointer<state>>(start_node)->state.max_level;
+            int level = actor_cast<node::stateful_pointer<state>>(start_node)->state.max_level - 1;
             // Send request to start node to search
             self->request(actor_cast<actor>(start_node), task_timeout, get_atom_v, actor_cast<strong_actor_ptr>(start_node), key, level);
        },
@@ -255,13 +251,12 @@ behavior server_handler(stateful_actor<server_state>* self) {
                 self->state.nodes.erase(self->state.nodes.begin()+i-1);
             self->request(actor_cast<actor>(leaving_node), task_timeout, delete_atom_v, key);
         },
-        [=](put_atom, const string& host, uint16_t port) {
+        [=](put_atom, int level, const string& host, uint16_t port) {
             // called in the run_server function
             self->state.myaddr.ip = host;
             self->state.myaddr.port = port;
-            int max_level = 4;
             auto tmp = self->spawn(node_impl);
-            anon_send(tmp, put_atom_v, INT32_MIN, max_level, port, host, false, get_ms_vector(max_level - 1));
+            anon_send(tmp, put_atom_v, INT32_MIN, level, port, host, false, get_ms_vector(level - 1));
             self->state.nodes.emplace_back(tmp);
         },
         [=](get_atom, const string& str) {
@@ -402,11 +397,12 @@ class config : public actor_system_config {
 public:
     uint16_t port = 0;
     string host = "localhost";
+    int level = 5;
     bool server_mode = false;
 
     config() {
-        add_actor_type("node_implementation", node_impl);
         opt_group{custom_options_, "global"}
+                .add(level, "level,l", "set level")
                 .add(port, "port,p", "set port")
                 .add(host, "host,H", "set host (ignored in server mode)")
                 .add(server_mode, "server-mode,s", "enable server mode");
@@ -502,7 +498,7 @@ void run_server(actor_system& system, const config& cfg) {
     }
     cout << "*** server successfully published at port " << *expected_port << endl
          << "*** press [enter] to quit" << endl;
-    anon_send(op_hdl, put_atom_v, cfg.host, *expected_port);
+    anon_send(op_hdl, put_atom_v, cfg.level, cfg.host, *expected_port);
     string dummy;
     std::getline(std::cin, dummy);
     cout << "Good Bye!" << endl;
@@ -515,4 +511,4 @@ void run_server(actor_system& system, const config& cfg) {
 }
 
 // creates a main function for us that calls our caf_main
-CAF_MAIN(id_block::skip_graph, io::middleman)
+CAF_MAIN(io::middleman)
