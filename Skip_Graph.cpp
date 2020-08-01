@@ -1,3 +1,9 @@
+// Run server at port 4242:
+// - ./Skip_Graph (--level=5) -s --host=192.168.144.128 --port=8888
+//
+// Run client at the same host:
+// - ./Skip_Graph --host=192.168.144.128 --port=8888
+
 #include <string>
 #include <iostream>
 #include <utility>
@@ -9,7 +15,7 @@
 
 using std::cout;
 using std::endl;
-using std::pair;
+using std::tuple;
 using std::string;
 using std::vector;
 using std::stringstream;
@@ -20,7 +26,7 @@ struct address {
     uint16_t port{};
 };
 
-using node_type = pair<strong_actor_ptr, address>;
+using node_type = tuple<strong_actor_ptr, address, int>;
 
 using node = typed_actor<
         result<void>(ok_atom),
@@ -103,9 +109,9 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 self->request(actor_cast<actor>(ptr), task_timeout, ok_atom_v);
             } else if (self->state.key < search_key) {
                 while (level >= 0) {
-                    auto ptr = transform(self->system(), self->state.right_neighbor[level].first,
-                                         self->state.right_neighbor[level].second.ip,
-                                         self->state.right_neighbor[level].second.port, self->state.server.ip);
+                    auto ptr = transform(self->system(), std::get<0>(self->state.right_neighbor[level]),
+                                         std::get<1>(self->state.right_neighbor[level]).ip,
+                                         std::get<1>(self->state.right_neighbor[level]).port, self->state.server.ip);
                     if (ptr && ptr->state.key <= search_key) {
                         auto hdl = actor_cast<actor>(ptr);
                         self->request(hdl, task_timeout, get_atom_v, actor1, actor2_ip, actor2_port, search_key, level);
@@ -114,8 +120,8 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 }
             } else {
                 while (level >= 0) {
-                    auto ptr = transform(self->system(), self->state.left_neighbor[level].first,
-                            self->state.left_neighbor[level].second.ip, self->state.left_neighbor[level].second.port, self->state.server.ip);
+                    auto ptr = transform(self->system(), std::get<0>(self->state.left_neighbor[level]),
+                                         std::get<1>(self->state.left_neighbor[level]).ip, std::get<1>(self->state.left_neighbor[level]).port, self->state.server.ip);
                     if (ptr && ptr->state.key >= search_key) {
                         auto hdl = actor_cast<actor>(ptr);
                         self->request(hdl, task_timeout, get_atom_v, actor1, actor2_ip, actor2_port, search_key, level);
@@ -133,13 +139,13 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
             cout << "New_node: Membership vector = " << new_node->state.ms_vector << ", Key = " << new_node->state.key << endl;
             // itself is the introduce node
             auto ptr = self;
-            auto ptr_r = transform(self->system(), self->state.right_neighbor[0].first,
-                                   self->state.right_neighbor[0].second.ip, self->state.right_neighbor[0].second.port,
+            auto ptr_r = transform(self->system(), std::get<0>(self->state.right_neighbor[0]),
+                                   std::get<1>(self->state.right_neighbor[0]).ip, std::get<1>(self->state.right_neighbor[0]).port,
                                    self->state.server.ip);
             while (ptr_r && ptr_r->state.key < new_node->state.key) {
                 ptr = ptr_r;
-                ptr_r = transform(self->system(), ptr_r->state.right_neighbor[0].first,
-                                  ptr_r->state.right_neighbor[0].second.ip, ptr_r->state.right_neighbor[0].second.port,
+                ptr_r = transform(self->system(), std::get<0>(ptr_r->state.right_neighbor[0]),
+                                  std::get<1>(ptr_r->state.right_neighbor[0]).ip, std::get<1>(ptr_r->state.right_neighbor[0]).port,
                                   ptr_r->state.server.ip);
             }
             int l = 0;
@@ -149,43 +155,43 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 if (ptr) {
                     if (ptr->state.server.ip == new_node->state.server.ip)
                         new_node->state.left_neighbor[l] = node_type(actor_cast<strong_actor_ptr>(ptr),
-                                                                     {ptr->state.server.ip, ptr->state.server.port});
+                                                                     {ptr->state.server.ip, ptr->state.server.port}, ptr->state.key);
                     else new_node->state.left_neighbor[l] = node_type(
-                                nullptr, {ptr->state.server.ip, ptr->state.server.port});
+                                nullptr, {ptr->state.server.ip, ptr->state.server.port}, ptr->state.key);
                 }
                 // Operation 2: new_node->state.right_neighbor[l] = ptr->state.right_neighbor[l];
-                auto tmp = transform(self->system(), ptr->state.right_neighbor[l].first,
-                        ptr->state.right_neighbor[l].second.ip, ptr->state.right_neighbor[l].second.port, ptr->state.server.ip);
+                auto tmp = transform(self->system(), std::get<0>(ptr->state.right_neighbor[l]),
+                                     std::get<1>(ptr->state.right_neighbor[l]).ip, std::get<1>(ptr->state.right_neighbor[l]).port, ptr->state.server.ip);
                 if (tmp) {
                     if (tmp->state.server.ip == new_node->state.server.ip)
                         new_node->state.right_neighbor[l] = node_type(actor_cast<strong_actor_ptr>(tmp),
-                                {tmp->state.server.ip, tmp->state.server.port});
+                                {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                     else new_node->state.right_neighbor[l] = node_type(
-                                nullptr, {tmp->state.server.ip, tmp->state.server.port});
+                                nullptr, {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                     // Operation 3:
                     // if (ptr->state.right_neighbor[l])
                     //     ptr->state.right_neighbor[l]->state.left_neighbor[l] = new_node;
-                    auto tmp_tmp = transform(self->system(), tmp->state.left_neighbor[l].first,
-                            tmp->state.left_neighbor[l].second.ip, tmp->state.left_neighbor[l].second.port, tmp->state.server.ip);
+                    auto tmp_tmp = transform(self->system(), std::get<0>(tmp->state.left_neighbor[l]),
+                                             std::get<1>(tmp->state.left_neighbor[l]).ip, std::get<1>(tmp->state.left_neighbor[l]).port, tmp->state.server.ip);
                     if (new_node->state.server.ip == tmp_tmp->state.server.ip)
                         tmp_tmp->state.left_neighbor[l] = node_type(actor_cast<strong_actor_ptr>(new_node),
-                                {new_node->state.server.ip, new_node->state.server.port});
+                                {new_node->state.server.ip, new_node->state.server.port}, new_node->state.key);
                     else tmp_tmp->state.left_neighbor[l] = node_type(
-                                nullptr, {new_node->state.server.ip, new_node->state.server.port});
+                                nullptr, {new_node->state.server.ip, new_node->state.server.port}, new_node->state.key);
                 }
                 // Operation 4: ptr->state.right_neighbor[l] = new_node;
                 if (ptr) {
                     if (new_node->state.server.ip == ptr->state.server.ip)
                         ptr->state.right_neighbor[l] = node_type(actor_cast<strong_actor_ptr>(new_node),
-                                                                 {new_node->state.server.ip, new_node->state.server.port});
+                                                                 {new_node->state.server.ip, new_node->state.server.port}, new_node->state.key);
                     else ptr->state.right_neighbor[l] = node_type(
-                                nullptr, {new_node->state.server.ip, new_node->state.server.port});
+                                nullptr, {new_node->state.server.ip, new_node->state.server.port}, new_node->state.key);
                 }
                 string t_ms_vector = new_node->state.ms_vector.substr(0, l+1); // target membership vector
                 while (ptr != nullptr && ptr->state.ms_vector.substr(0, l+1) != t_ms_vector) {
                     // ptr = ptr->state.left_neighbor[l];
-                    ptr = transform(self->system(), ptr->state.left_neighbor[l].first,
-                            ptr->state.left_neighbor[l].second.ip, ptr->state.left_neighbor[l].second.port, ptr->state.server.ip);
+                    ptr = transform(self->system(), std::get<0>(ptr->state.left_neighbor[l]),
+                                    std::get<1>(ptr->state.left_neighbor[l]).ip, std::get<1>(ptr->state.left_neighbor[l]).port, ptr->state.server.ip);
                 }
                 if (ptr && l + 1 < new_node->state.max_level) {
                     l = l + 1;
@@ -196,8 +202,8 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
             node::stateful_pointer<state> ptr = self;
             while (ptr && ptr->state.key != key) {
                 // ptr = ptr->state.right_neighbor[0];
-                ptr = transform(self->system(), ptr->state.right_neighbor[0].first,
-                                ptr->state.right_neighbor[0].second.ip, ptr->state.right_neighbor[0].second.port, ptr->state.server.ip);
+                ptr = transform(self->system(), std::get<0>(ptr->state.right_neighbor[0]),
+                                std::get<1>(ptr->state.right_neighbor[0]).ip, std::get<1>(ptr->state.right_neighbor[0]).port, ptr->state.server.ip);
             }
             if (ptr == nullptr || ptr->state.key != key) {
                 cout << "The element does not exist!" << endl;
@@ -206,27 +212,29 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 for (int i = 0; i < ptr->state.max_level; i++) {
                     // if (ptr->state.left_neighbor[i])
                     //     ptr->state.left_neighbor[i]->state.right_neighbor[i] = ptr->state.right_neighbor[i];
-                    auto tmp = transform(self->system(), ptr->state.left_neighbor[i].first,
-                                         ptr->state.left_neighbor[i].second.ip, ptr->state.left_neighbor[i].second.port, ptr->state.server.ip);
+                    auto tmp = transform(self->system(), std::get<0>(ptr->state.left_neighbor[i]),
+                                         std::get<1>(ptr->state.left_neighbor[i]).ip, std::get<1>(ptr->state.left_neighbor[i]).port, ptr->state.server.ip);
                     if (tmp) {
-                        auto tmp_tmp = transform(self->system(), tmp->state.right_neighbor[i].first,
-                                                 tmp->state.right_neighbor[i].second.ip, tmp->state.right_neighbor[i].second.port, tmp->state.server.ip);
+                        auto tmp_tmp = transform(self->system(), std::get<0>(tmp->state.right_neighbor[i]),
+                                                 std::get<1>(tmp->state.right_neighbor[i]).ip, std::get<1>(tmp->state.right_neighbor[i]).port, tmp->state.server.ip);
                         if (tmp->state.server.ip == tmp_tmp->state.server.ip)
-                            tmp_tmp->state.right_neighbor[i] = node_type(actor_cast<strong_actor_ptr>(tmp), {"0", 0});
+                            tmp_tmp->state.right_neighbor[i] = node_type(actor_cast<strong_actor_ptr>(tmp),
+                                    {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                         else tmp_tmp->state.right_neighbor[i] = node_type(
-                                    nullptr, {tmp->state.server.ip, tmp->state.server.port});
+                                    nullptr, {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                     }
                     // if (ptr->state.right_neighbor[i])
                     //     ptr->state.right_neighbor[i]->state.left_neighbor[i] = ptr->state.left_neighbor[i];
-                    tmp = transform(self->system(), ptr->state.right_neighbor[i].first,
-                                    ptr->state.right_neighbor[i].second.ip, ptr->state.right_neighbor[i].second.port, tmp->state.server.ip);
+                    tmp = transform(self->system(), std::get<0>(ptr->state.right_neighbor[i]),
+                                    std::get<1>(ptr->state.right_neighbor[i]).ip, std::get<1>(ptr->state.right_neighbor[i]).port, tmp->state.server.ip);
                     if (tmp) {
-                        auto tmp_tmp = transform(self->system(), tmp->state.left_neighbor[i].first,
-                                                 tmp->state.left_neighbor[i].second.ip, tmp->state.left_neighbor[i].second.port, tmp->state.server.ip);
+                        auto tmp_tmp = transform(self->system(), std::get<0>(tmp->state.left_neighbor[i]),
+                                                 std::get<1>(tmp->state.left_neighbor[i]).ip, std::get<1>(tmp->state.left_neighbor[i]).port, tmp->state.server.ip);
                         if (tmp->state.server.ip == tmp_tmp->state.server.ip)
-                            tmp_tmp->state.left_neighbor[i] = node_type(actor_cast<strong_actor_ptr>(tmp), {"0", 0});
+                            tmp_tmp->state.left_neighbor[i] = node_type(actor_cast<strong_actor_ptr>(tmp),
+                                    {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                         else tmp_tmp->state.left_neighbor[i] = node_type(
-                                    nullptr, {tmp->state.server.ip, tmp->state.server.port});
+                                    nullptr, {tmp->state.server.ip, tmp->state.server.port}, tmp->state.key);
                     }
                 }
                 ptr->state.delete_flag = true;
@@ -248,22 +256,22 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
             // while (begin_node->state.left_neighbor[0])
             //     begin_node = begin_node->state.right_neighbor[0];
             auto ptr = self;
-            auto ptr_r = transform(self->system(), self->state.left_neighbor[0].first,
-                                 self->state.left_neighbor[0].second.ip, self->state.left_neighbor[0].second.port,
+            auto ptr_r = transform(self->system(), std::get<0>(self->state.left_neighbor[0]),
+                                   std::get<1>(self->state.left_neighbor[0]).ip, std::get<1>(self->state.left_neighbor[0]).port,
                                  self->state.server.ip);
             while (ptr_r) {
                 // begin_node = begin_node->state.left_neighbor[0];
                 ptr = ptr_r;
-                ptr_r = transform(self->system(), ptr->state.left_neighbor[0].first,
-                                  ptr->state.left_neighbor[0].second.ip, ptr->state.left_neighbor[0].second.port,
+                ptr_r = transform(self->system(), std::get<0>(ptr->state.left_neighbor[0]),
+                                  std::get<1>(ptr->state.left_neighbor[0]).ip, std::get<1>(ptr->state.left_neighbor[0]).port,
                                   ptr->state.server.ip);
             }
             int max_level = self->state.max_level;
             for (int i = max_level-1; i >= 0; i--) {
                 auto iter = ptr;
                 cout << "Level " << std::to_string(i) << ": head" << " (" << iter->state.ms_vector << ") ----- ";
-                iter = transform(self->system(), iter->state.right_neighbor[i].first,
-                                 iter->state.right_neighbor[i].second.ip, iter->state.right_neighbor[i].second.port,
+                iter = transform(self->system(), std::get<0>(iter->state.right_neighbor[i]),
+                                 std::get<1>(iter->state.right_neighbor[i]).ip, std::get<1>(iter->state.right_neighbor[i]).port,
                                  iter->state.server.ip);
                 // while (iter->state.right_neighbor[i]) {
                 //     cout << iter->state.right_neighbor[i]->state.key
@@ -272,8 +280,8 @@ node::behavior_type node_impl(node::stateful_pointer<state> self) {
                 while (iter) {
                     cout << iter->state.key
                          << " (" << iter->state.ms_vector << ") ----- ";
-                    iter = transform(self->system(), iter->state.right_neighbor[0].first,
-                                     iter->state.right_neighbor[0].second.ip, iter->state.right_neighbor[0].second.port,
+                    iter = transform(self->system(), std::get<0>(iter->state.right_neighbor[i]),
+                                     std::get<1>(iter->state.right_neighbor[i]).ip, std::get<1>(iter->state.right_neighbor[i]).port,
                                      iter->state.server.ip);
                 }
                 cout << "tail" << endl;
